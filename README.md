@@ -35,8 +35,6 @@ git clone https://github.com/AjIndia77/ServerHealthCheck-CLI.git
 cd ServerHealthCheck-CLI
 ```
 
-Replace `https://github.com/AjIndia77/ServerHealthCheck-CLI.git` with your repository's clone URL.
-
 ## Usage
 
 Run the tool against a website:
