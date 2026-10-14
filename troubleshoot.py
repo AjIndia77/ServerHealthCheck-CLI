@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import argparse
@@ -235,8 +234,8 @@ def read_memory():
         return finding(
             "Memory", "WARNING" if used_percent >= 90 else "PASS",
             {
-                "total_bytes": total,
-                "available_bytes": available,
+                "total_mb": round(total / (1024 ** 2), 1),
+                "available_mb": round(available / (1024 ** 2), 1),
                 "estimated_used_percent": used_percent,
             },
             "Inspect memory pressure and processes."
@@ -256,9 +255,9 @@ def check_disk():
         "Root filesystem",
         status,
         {
-            "total_bytes": usage.total,
-            "used_bytes": usage.used,
-            "free_bytes": usage.free,
+            "total_gb": round(usage.total / (1024 ** 3), 2),
+            "used_gb": round(usage.used / (1024 ** 3), 2),
+            "free_gb": round(usage.free / (1024 ** 3), 2),
             "used_percent": used_percent,
         },
         "Identify large files and check safe cleanup options."
@@ -323,10 +322,6 @@ def check_service(service):
 
 
 def check_recent_logs():
-    with path.open(
-        "r", encoding="utf-8", errors="replace"
-    ) as file:
-        lines = list(deque(file, maxlen=100))
     results = []
 
     # Read a bounded number of recent lines only.
@@ -448,6 +443,25 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
+    checks = report["checks"]
+
+    critical_checks = {"DNS", "HTTP"}
+    if any(
+        check["check"] in critical_checks
+        and check["status"] == "FAIL"
+        for check in checks
+    ):
+        overall_status = "CRITICAL"
+    elif any(
+        check["status"] in {"WARNING", "FAIL"}
+        for check in checks
+    ):
+        overall_status = "WARNING"
+    else:
+        overall_status = "HEALTHY"
+
+    report["overall_status"] = overall_status
+
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -464,6 +478,7 @@ def main():
         pass
 
     print(f"\nWebsite Troubleshooter: {args.url}")
+    print(f"Overall Status: {report['overall_status']}")
     print("-" * 60)
 
     for check in report["checks"]:
