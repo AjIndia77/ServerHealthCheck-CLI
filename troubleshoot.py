@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+import re
 import argparse
 import datetime as dt
 import json
@@ -378,6 +378,223 @@ def check_recent_logs():
     )
 
 
+def check_apache_workers():
+    """Read-only Apache process and worker-capacity check."""
+    code, output = run_command(
+        ["ps", "-eo", "pid=,ppid=,comm=,args="]
+    )
+
+    if code != 0:
+        return finding(
+            "Apache workers", "INFO", output,
+            "Check whether ps is available."
+        )
+
+    processes = []
+    for line in output.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 3:
+            continue
+
+        pid, ppid, comm = parts[:3]
+        args = parts[3] if len(parts) > 3 else ""
+
+        if comm in ("apache2", "httpd"):
+            processes.append({
+                "pid": int(pid),
+                "ppid": int(ppid),
+                "args": args,
+            })
+
+    if not processes:
+        return finding(
+            "Apache workers", "INFO",
+            {"process_count": 0},
+            "Apache processes were not detected on this machine."
+        )
+
+    pids = {proc["pid"] for proc in processes}
+    masters = [
+        proc for proc in processes if proc["ppid"] not in pids
+    ]
+    worker_count = len(processes) - len(masters)
+
+    # Read common Apache MPM configuration locations.
+    config_paths = [
+        Path("/etc/apache2"),
+        Path("/etc/httpd"),
+    ]
+    max_workers_values = []
+
+    for base in config_paths:
+        if not base.is_dir():
+            continue
+
+        try:
+            for path in base.rglob("*.conf"):
+                try:
+                    # Skip unusually large config files.
+                    if path.stat().st_size > 1_000_000:
+                        continue
+                    content = path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    continue
+
+                for match in re.finditer(
+                    r"(?im)^\s*MaxRequestWorkers\s+(\d+)\b",
+                    content,
+                ):
+                    max_workers_values.append({
+                        "file": str(path),
+                        "value": int(match.group(1)),
+                    })
+        except OSError:
+            pass
+
+    evidence = {
+        "process_count": len(processes),
+        "detected_master_count": len(masters),
+        "estimated_worker_process_count": worker_count,
+        "configured_max_request_workers": max_workers_values,
+        "note": (
+            "Process count is a snapshot, not a count of busy requests. "
+            "Included configuration values may not all be active."
+        ),
+    }
+
+    status = "PASS"
+    next_step = None
+
+    # Warn only when one detected configured limit is reached.
+    if any(
+        worker_count >= item["value"]
+        for item in max_workers_values
+        if item["value"] > 0
+    ):
+        status = "WARNING"
+        next_step = (
+            "Verify the active Apache MPM configuration and inspect "
+            "server-status or Apache logs for worker saturation."
+        )
+
+    return finding(
+        "Apache workers", status, evidence, next_step
+    )
+
+
+def check_php_fpm_workers():
+    """Read-only PHP-FPM process and configured capacity check."""
+    code, output = run_command(
+        ["ps", "-eo", "pid=,ppid=,comm=,args="]
+    )
+
+    if code != 0:
+        return finding(
+            "PHP-FPM workers", "INFO", output,
+            "Check whether ps is available."
+        )
+
+    processes = []
+    for line in output.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 3:
+            continue
+
+        pid, ppid, comm = parts[:3]
+        args = parts[3] if len(parts) > 3 else ""
+
+        if "php-fpm" in comm.lower() or "php-fpm:" in args.lower():
+            processes.append({
+                "pid": int(pid),
+                "ppid": int(ppid),
+                "comm": comm,
+                "args": args,
+            })
+
+    worker_processes = [
+        proc for proc in processes
+        if "pool " in proc["args"].lower()
+    ]
+
+    # Read common PHP-FPM pool configuration files.
+    config_values = []
+    for base in (Path("/etc/php"), Path("/etc/php-fpm.d")):
+        if not base.is_dir():
+            continue
+
+        try:
+            for path in base.rglob("*.conf"):
+                try:
+                    if path.stat().st_size > 1_000_000:
+                        continue
+                    content = path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    continue
+
+                pool = "unknown"
+                section = re.search(
+                    r"(?m)^\s*\[([^\]]+)\]\s*$", content
+                )
+                if section:
+                    pool = section.group(1).strip()
+
+                max_children = re.search(
+                    r"(?m)^\s*pm\.max_children\s*=\s*(\d+)\s*$",
+                    content,
+                )
+                if max_children:
+                    config_values.append({
+                        "file": str(path),
+                        "pool": pool,
+                        "pm.max_children": int(max_children.group(1)),
+                    })
+        except OSError:
+            pass
+
+    if not processes and not config_values:
+        return finding(
+            "PHP-FPM workers", "INFO",
+            {
+                "process_count": 0,
+                "configured_pools_found": 0,
+            },
+            "PHP-FPM was not detected. The server may use mod_php "
+            "or may not run PHP-FPM locally."
+        )
+
+    evidence = {
+        "php_fpm_process_count": len(processes),
+        "detected_pool_worker_count": len(worker_processes),
+        "configured_pool_limits": config_values,
+        "busy_idle_counts": (
+            "Not available from process listing alone; use a "
+            "properly secured PHP-FPM status interface."
+        ),
+    }
+
+    status = "PASS"
+    next_step = None
+
+    # Only compare when there is exactly one configured pool limit;
+    # multi-pool process counts cannot be safely compared as a group.
+    if len(config_values) == 1:
+        limit = config_values[0]["pm.max_children"]
+        if limit > 0 and len(worker_processes) >= limit:
+            status = "WARNING"
+            next_step = (
+                "Check PHP-FPM pool status and logs to confirm whether "
+                "the pool has reached pm.max_children."
+            )
+
+    return finding(
+        "PHP-FPM workers", status, evidence, next_step
+    )
+
+
 def diagnose(url):
     parsed = urlparse(url)
 
@@ -421,6 +638,8 @@ def diagnose(url):
     for service in WEB_SERVICES:
         report["checks"].append(check_service(service))
 
+    report["checks"].append(check_apache_workers())
+    report["checks"].append(check_php_fpm_workers())
     report["checks"].append(check_recent_logs())
 
     return report
