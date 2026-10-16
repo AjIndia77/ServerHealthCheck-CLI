@@ -232,7 +232,7 @@ def read_memory():
         used_percent = round((total - available) / total * 100, 1)
 
         return finding(
-            "Memory", "WARNING" if used_percent >= 90 else "PASS",
+            "Memory", "WARNING" if used_percent >= 85 else "PASS",
             {
                 "total_mb": round(total / (1024 ** 2), 1),
                 "available_mb": round(available / (1024 ** 2), 1),
