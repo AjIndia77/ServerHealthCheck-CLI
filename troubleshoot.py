@@ -35,6 +35,30 @@ LOG_FILES = (
     "/var/log/nginx/error.log",
 )
 
+DB_CPU_THRESHOLD = 50.0  # % of one core
+
+DB_PROCESS_MAP = {
+    "mysqld": "MySQL/MariaDB",
+    "mariadbd": "MySQL/MariaDB",
+    "postgres": "PostgreSQL",
+    "mongod": "MongoDB",
+    "redis-server": "Redis",
+}
+
+DB_SERVICE_MAP = {
+    "MySQL/MariaDB": ("mysql", "mariadb", "mysqld"),
+    "PostgreSQL": ("postgresql",),
+    "MongoDB": ("mongod",),
+    "Redis": ("redis-server", "redis"),
+}
+
+DB_PORTS = {
+    "MySQL/MariaDB": 3306,
+    "PostgreSQL": 5432,
+    "MongoDB": 27017,
+    "Redis": 6379,
+}
+
 
 def finding(name, status, evidence, next_step=None):
     return {
@@ -594,6 +618,208 @@ def check_php_fpm_workers():
         "PHP-FPM workers", status, evidence, next_step
     )
 
+def read_cpu_ticks(pid):
+    """Return utime+stime ticks for a PID from /proc, or None."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as file:
+            data = file.read()
+        # comm can contain spaces, so split after the last ')'.
+        fields = data.rsplit(")", 1)[1].split()
+        return int(fields[11]) + int(fields[12])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def detect_databases(sample_seconds=1.0):
+    """Detect running DB engines and measure their live CPU usage."""
+    code, output = run_command(["ps", "-eo", "pid=,comm="])
+    if code != 0:
+        return None, output
+
+    engines = {}
+    for line in output.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid, comm = int(parts[0]), parts[1].strip()
+        engine = DB_PROCESS_MAP.get(comm)
+        if engine:
+            engines.setdefault(engine, []).append(pid)
+
+    # Two samples of CPU ticks = current CPU usage, not lifetime average.
+    before = {
+        pid: read_cpu_ticks(pid)
+        for pids in engines.values() for pid in pids
+    }
+    start = time.monotonic()
+    time.sleep(sample_seconds)
+    elapsed = time.monotonic() - start
+    clk = os.sysconf("SC_CLK_TCK")
+
+    result = {}
+    for engine, pids in engines.items():
+        total = 0.0
+        for pid in pids:
+            a, b = before.get(pid), read_cpu_ticks(pid)
+            if a is not None and b is not None:
+                total += (b - a) / clk / elapsed * 100
+        result[engine] = {
+            "pids": pids,
+            "cpu_percent": round(total, 1),
+        }
+    return result, None
+
+
+def check_database_status(databases, error=None):
+    if databases is None:
+        return finding(
+            "Database detection", "INFO", error,
+            "Check whether ps is available."
+        )
+
+    if not databases:
+        return finding(
+            "Database detection", "INFO",
+            "No MySQL/MariaDB, PostgreSQL, MongoDB or Redis "
+            "process found on this machine.",
+            "Database may be remote (RDS, another server) or "
+            "use a different engine."
+        )
+
+    details = []
+    status = "PASS"
+    next_step = None
+
+    for engine, info in databases.items():
+        # 1) systemd view
+        service_state = "unknown"
+        for name in DB_SERVICE_MAP[engine]:
+            code, out = run_command(["systemctl", "is-active", name])
+            if out in ("active", "inactive", "failed",
+                       "activating", "deactivating"):
+                service_state = f"{name}: {out}"
+                if out == "active":
+                    break
+
+        # 2) Port view
+        port = DB_PORTS[engine]
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", port), timeout=2
+            ):
+                port_open = True
+        except OSError:
+            port_open = False
+
+        # 3) Engine-level ping (works only if auth allows it)
+        ping = "not tested"
+        if engine == "MySQL/MariaDB" and shutil.which("mysqladmin"):
+            code, out = run_command(
+                ["mysqladmin", "--connect-timeout=3", "ping"]
+            )
+            ping = out[:200]
+        elif engine == "PostgreSQL" and shutil.which("pg_isready"):
+            code, out = run_command(["pg_isready", "-t", "3"])
+            ping = out[:200]
+
+        if not port_open or "active" not in service_state.split(": ")[-1:]:
+            if not port_open:
+                status = "WARNING"
+                next_step = (
+                    "Process exists but port is not accepting "
+                    "connections; check DB logs and systemctl status."
+                )
+
+        details.append({
+            "engine": engine,
+            "process_count": len(info["pids"]),
+            "service": service_state,
+            f"port_{port}_open": port_open,
+            "ping": ping,
+            "cpu_percent_now": info["cpu_percent"],
+        })
+
+    return finding("Database status", status, details, next_step)
+
+
+def check_database_cpu(databases):
+    if not databases:
+        return finding("Database CPU", "INFO", "No database detected.")
+
+    cpus = {e: i["cpu_percent"] for e, i in databases.items()}
+    busy = [e for e, c in cpus.items() if c >= DB_CPU_THRESHOLD]
+
+    return finding(
+        "Database CPU",
+        "WARNING" if busy else "PASS",
+        {"cpu_percent_per_engine": cpus,
+         "threshold_percent": DB_CPU_THRESHOLD,
+         "note": "100% = one full CPU core."},
+        "Check the running queries below." if busy else None,
+    )
+
+
+def check_database_queries(databases):
+    """Show running queries only when a DB is using high CPU.
+    Read-only SELECT/SHOW queries. Uses existing auth config
+    (~/.my.cnf, PG* env vars, or local socket); no passwords here."""
+    findings = []
+
+    for engine, info in (databases or {}).items():
+        if info["cpu_percent"] < DB_CPU_THRESHOLD:
+            continue
+
+        if engine == "MySQL/MariaDB" and shutil.which("mysql"):
+            sql = (
+                "SELECT id, user, db, time, state, LEFT(info, 200) "
+                "FROM information_schema.processlist "
+                "WHERE command <> 'Sleep' AND id <> CONNECTION_ID() "
+                "ORDER BY time DESC LIMIT 5"
+            )
+            code, out = run_command(
+                ["mysql", "--connect-timeout=3", "--batch", "-e", sql],
+                timeout=10,
+            )
+            fix = ("Create a read-only monitoring user and put it in "
+                   "~/.my.cnf (chmod 600).")
+
+        elif engine == "PostgreSQL" and shutil.which("psql"):
+            sql = (
+                "SELECT pid, usename, datname, "
+                "now() - query_start AS running_for, state, "
+                "left(query, 200) AS query "
+                "FROM pg_stat_activity "
+                "WHERE state = 'active' AND pid <> pg_backend_pid() "
+                "ORDER BY query_start LIMIT 5"
+            )
+            code, out = run_command(
+                ["psql", "-X", "-A", "-c", sql], timeout=10
+            )
+            fix = ("Set PGUSER/PGHOST/PGDATABASE (and ~/.pgpass) for a "
+                   "read-only monitoring role.")
+        else:
+            findings.append(finding(
+                f"Top queries: {engine}", "INFO",
+                "Query inspection is not supported for this engine "
+                "or the client tool is missing.",
+            ))
+            continue
+
+        if code != 0:
+            findings.append(finding(
+                f"Top queries: {engine}", "INFO", out[:300], fix
+            ))
+        else:
+            findings.append(finding(
+                f"Top queries: {engine}", "WARNING",
+                {"longest_running_active_queries":
+                    out.splitlines()[:7]},
+                "Review the longest query with EXPLAIN; check "
+                "missing indexes. Queries may contain sensitive "
+                "data; review before sharing.",
+            ))
+
+    return findings
 
 def diagnose(url):
     parsed = urlparse(url)
@@ -640,6 +866,10 @@ def diagnose(url):
 
     report["checks"].append(check_apache_workers())
     report["checks"].append(check_php_fpm_workers())
+    databases, db_error = detect_databases()
+    report["checks"].append(check_database_status(databases, db_error))
+    report["checks"].append(check_database_cpu(databases))
+    report["checks"].extend(check_database_queries(databases))
     report["checks"].append(check_recent_logs())
 
     return report
